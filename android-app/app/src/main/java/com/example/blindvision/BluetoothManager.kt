@@ -22,7 +22,7 @@ class BluetoothManager(private val onDistanceReceived: (Int) -> Unit) {
 
         while (isRunning) {
             try {
-                val device = adapter.bondedDevices.find { it.name == deviceName }
+                val device = adapter.bondedDevices?.find { it.name == deviceName }
                 if (device == null) {
                     delay(3000)
                     continue
@@ -42,6 +42,7 @@ class BluetoothManager(private val onDistanceReceived: (Int) -> Unit) {
                 }
             } catch (_: Exception) {
                 try { socket?.close() } catch (_: Exception) {}
+                socket = null
                 delay(2000) // Baglanti koparsa 2 saniye sonra otomatik tekrar dene
             }
         }
@@ -50,5 +51,6 @@ class BluetoothManager(private val onDistanceReceived: (Int) -> Unit) {
     fun close() {
         isRunning = false
         try { socket?.close() } catch (_: Exception) {}
+        socket = null
     }
 }

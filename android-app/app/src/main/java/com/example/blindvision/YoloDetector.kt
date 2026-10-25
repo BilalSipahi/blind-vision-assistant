@@ -19,65 +19,143 @@ class YoloDetector(
     private var interpreter: Interpreter
     private var labels: List<String>
     private val inputSize = 640
-    private val numElements = 8400
-    private val numChannels = 84
-    private val confThreshold = 0.45f
-    private val iouThreshold = 0.50f
+    private var numElements = 8400
+    private var numChannels = 84
+    private var isTransposed = false
+    private var isNCHW = false
+    private val confThreshold = 0.20f // Tespit hassasiyeti (Kucuk objeler / su sisesi icin 0.20)
+    private val iouThreshold = 0.45f
+
+    private val inputBuffer: ByteBuffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3).apply {
+        order(ByteOrder.nativeOrder())
+    }
+    private val intValues = IntArray(inputSize * inputSize)
+
+    private var outputNotTransposed: Array<Array<FloatArray>>? = null
+    private var outputTransposed: Array<Array<FloatArray>>? = null
 
     init {
         val options = Interpreter.Options()
-        val compatList = CompatibilityList()
-        if (compatList.isDelegateSupportedOnThisDevice) {
-            options.addDelegate(GpuDelegate(compatList.bestOptionsForThisDevice))
-        } else {
+        try {
+            val compatList = CompatibilityList()
+            if (compatList.isDelegateSupportedOnThisDevice) {
+                options.addDelegate(GpuDelegate(compatList.bestOptionsForThisDevice))
+            } else {
+                options.setNumThreads(4)
+            }
+        } catch (_: Exception) {
             options.setNumThreads(4)
         }
+
         val modelBuffer = FileUtil.loadMappedFile(context, modelPath)
         interpreter = Interpreter(modelBuffer, options)
         labels = FileUtil.loadLabels(context, labelPath)
+
+        val inputShape = interpreter.getInputTensor(0).shape()
+        // [1, 3, 640, 640] -> NCHW format
+        isNCHW = (inputShape.size == 4 && inputShape[1] == 3)
+
+        val outputShape = interpreter.getOutputTensor(0).shape()
+        if (outputShape.size == 3) {
+            if (outputShape[1] == 84 || outputShape[1] < outputShape[2]) {
+                numChannels = outputShape[1]
+                numElements = outputShape[2]
+                isTransposed = false
+            } else {
+                numElements = outputShape[1]
+                numChannels = outputShape[2]
+                isTransposed = true
+            }
+        }
+
+        if (!isTransposed) {
+            outputNotTransposed = Array(1) { Array(numChannels) { FloatArray(numElements) } }
+        } else {
+            outputTransposed = Array(1) { Array(numElements) { FloatArray(numChannels) } }
+        }
     }
 
     fun detect(bitmap: Bitmap): List<DetectionResult> {
         val resized = Bitmap.createScaledBitmap(bitmap, inputSize, inputSize, false)
-        val inputBuffer = bitmapToByteBuffer(resized)
-
-        // YOLOv8 TFLite cikti boyutu: [1, 84, 8400]
-        val output = Array(1) { Array(numChannels) { FloatArray(numElements) } }
-        interpreter.run(inputBuffer, output)
+        val inBuf = bitmapToByteBuffer(resized)
 
         val candidates = mutableListOf<BoxCandidate>()
-        for (i in 0 until numElements) {
-            var maxConf = -1f
-            var maxClassIdx = -1
-            for (c in 4 until numChannels) {
-                val score = output[0][c][i]
-                if (score > maxConf) {
-                    maxConf = score
-                    maxClassIdx = c - 4
+
+        if (!isTransposed) {
+            val output = outputNotTransposed!!
+            interpreter.run(inBuf, output)
+
+            for (i in 0 until numElements) {
+                var maxConf = -1f
+                var maxClassIdx = -1
+                for (c in 4 until numChannels) {
+                    val score = output[0][c][i]
+                    if (score > maxConf) {
+                        maxConf = score
+                        maxClassIdx = c - 4
+                    }
+                }
+
+                if (maxConf >= confThreshold && maxClassIdx in labels.indices) {
+                    val cx = output[0][0][i]
+                    val cy = output[0][1][i]
+                    val w = output[0][2][i]
+                    val h = output[0][3][i]
+
+                    val normCx = if (cx > 1f) cx / inputSize else cx
+                    val normCy = if (cy > 1f) cy / inputSize else cy
+                    val normW = if (w > 1f) w / inputSize else w
+                    val normH = if (h > 1f) h / inputSize else h
+
+                    candidates.add(
+                        BoxCandidate(
+                            label = labels[maxClassIdx],
+                            conf = maxConf,
+                            cx = normCx,
+                            cy = normCy,
+                            w = normW,
+                            h = normH
+                        )
+                    )
                 }
             }
+        } else {
+            val output = outputTransposed!!
+            interpreter.run(inBuf, output)
 
-            if (maxConf >= confThreshold && maxClassIdx in labels.indices) {
-                val cx = output[0][0][i]
-                val cy = output[0][1][i]
-                val w = output[0][2][i]
-                val h = output[0][3][i]
+            for (i in 0 until numElements) {
+                var maxConf = -1f
+                var maxClassIdx = -1
+                for (c in 4 until numChannels) {
+                    val score = output[0][i][c]
+                    if (score > maxConf) {
+                        maxConf = score
+                        maxClassIdx = c - 4
+                    }
+                }
 
-                val normCx = if (cx > 1f) cx / inputSize else cx
-                val normCy = if (cy > 1f) cy / inputSize else cy
-                val normW = if (w > 1f) w / inputSize else w
-                val normH = if (h > 1f) h / inputSize else h
+                if (maxConf >= confThreshold && maxClassIdx in labels.indices) {
+                    val cx = output[0][i][0]
+                    val cy = output[0][i][1]
+                    val w = output[0][i][2]
+                    val h = output[0][i][3]
 
-                candidates.add(
-                    BoxCandidate(
-                        label = labels[maxClassIdx],
-                        conf = maxConf,
-                        cx = normCx,
-                        cy = normCy,
-                        w = normW,
-                        h = normH
+                    val normCx = if (cx > 1f) cx / inputSize else cx
+                    val normCy = if (cy > 1f) cy / inputSize else cy
+                    val normW = if (w > 1f) w / inputSize else w
+                    val normH = if (h > 1f) h / inputSize else h
+
+                    candidates.add(
+                        BoxCandidate(
+                            label = labels[maxClassIdx],
+                            conf = maxConf,
+                            cx = normCx,
+                            cy = normCy,
+                            w = normW,
+                            h = normH
+                        )
                     )
-                )
+                }
             }
         }
 
@@ -93,21 +171,37 @@ class YoloDetector(
     }
 
     private fun bitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val buffer = ByteBuffer.allocateDirect(4 * inputSize * inputSize * 3)
-        buffer.order(ByteOrder.nativeOrder())
-        val intValues = IntArray(inputSize * inputSize)
+        inputBuffer.rewind()
         bitmap.getPixels(intValues, 0, inputSize, 0, 0, inputSize, inputSize)
 
-        for (pixel in intValues) {
-            val r = ((pixel shr 16) and 0xFF) / 255.0f
-            val g = ((pixel shr 8) and 0xFF) / 255.0f
-            val b = (pixel and 0xFF) / 255.0f
-            buffer.putFloat(r)
-            buffer.putFloat(g)
-            buffer.putFloat(b)
+        val totalPixels = inputSize * inputSize
+
+        if (isNCHW) {
+            // NCHW format [1, 3, 640, 640]: Red plane, Green plane, Blue plane
+            for (i in 0 until totalPixels) {
+                val pixel = intValues[i]
+                inputBuffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f)
+            }
+            for (i in 0 until totalPixels) {
+                val pixel = intValues[i]
+                inputBuffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)
+            }
+            for (i in 0 until totalPixels) {
+                val pixel = intValues[i]
+                inputBuffer.putFloat((pixel and 0xFF) / 255.0f)
+            }
+        } else {
+            // NHWC format [1, 640, 640, 3]: Interleaved R, G, B
+            for (i in 0 until totalPixels) {
+                val pixel = intValues[i]
+                inputBuffer.putFloat(((pixel shr 16) and 0xFF) / 255.0f)
+                inputBuffer.putFloat(((pixel shr 8) and 0xFF) / 255.0f)
+                inputBuffer.putFloat((pixel and 0xFF) / 255.0f)
+            }
         }
-        buffer.rewind()
-        return buffer
+
+        inputBuffer.rewind()
+        return inputBuffer
     }
 
     private fun applyNMS(boxes: List<BoxCandidate>): List<BoxCandidate> {
@@ -140,7 +234,9 @@ class YoloDetector(
     }
 
     fun close() {
-        interpreter.close()
+        try {
+            interpreter.close()
+        } catch (_: Exception) {}
     }
 
     private data class BoxCandidate(

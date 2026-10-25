@@ -1,5 +1,14 @@
 import os
 import shutil
+import torch
+
+# PyTorch 2.6+ weights_only monkeypatch
+_original_load = torch.load
+def _custom_load(*args, **kwargs):
+    kwargs['weights_only'] = False
+    return _original_load(*args, **kwargs)
+torch.load = _custom_load
+
 from ultralytics import YOLO
 
 COCO_LABELS_TR = [

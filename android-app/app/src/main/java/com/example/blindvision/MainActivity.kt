@@ -2,6 +2,8 @@ package com.example.blindvision
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
@@ -64,7 +66,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         try {
             yoloDetector = YoloDetector(this)
         } catch (e: Exception) {
-            statusText.text = "Model bulunamadı! assets klasörüne .tflite ekleyin."
+            statusText.text = "Model Hatası: ${e.localizedMessage}\nassets klasörüne .tflite ve labels.txt ekleyin."
         }
 
         bluetoothManager = BluetoothManager { dist ->
@@ -86,13 +88,20 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (missing.isEmpty()) {
             startSystem()
         } else {
+            statusText.text = "Gerekli izinler (Kamera/Bluetooth) bekleniyor..."
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
         }
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 101) startSystem()
+        if (requestCode == 101) {
+            if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+                startSystem()
+            } else {
+                statusText.text = "Kamera ve Bluetooth izinleri verilmedi!"
+            }
+        }
     }
 
     private fun startSystem() {
@@ -103,37 +112,77 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun startCamera() {
+        statusText.text = "Kamera Başlatılıyor..."
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
-            val cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
+            try {
+                val cameraProvider = cameraProviderFuture.get()
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
 
-            val imageAnalysis = ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
+                statusText.text = "Kamera Aktif - Nesne Tespiti Başlatılıyor..."
 
-            imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                val now = System.currentTimeMillis()
-                if (now - lastInferenceTime >= inferenceIntervalMs && yoloDetector != null) {
-                    lastInferenceTime = now
-                    val bitmap = imageProxy.toBitmap()
-                    val results = yoloDetector!!.detect(bitmap)
-                    val warning = decisionEngine.evaluateDetections(results, currentDistanceCm)
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
 
-                    if (warning != null) {
-                        runOnUiThread {
-                            statusText.text = warning
-                            speak(warning)
+                imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
+                    try {
+                        val now = System.currentTimeMillis()
+                        if (now - lastInferenceTime >= inferenceIntervalMs) {
+                            lastInferenceTime = now
+                            if (yoloDetector != null) {
+                                val rawBitmap = imageProxy.toBitmap()
+                                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                                val bitmap = if (rotationDegrees != 0) {
+                                    val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                                    Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
+                                } else {
+                                    rawBitmap
+                                }
+
+                                val results = yoloDetector!!.detect(bitmap)
+                                val warning = decisionEngine.evaluateDetections(results, currentDistanceCm)
+
+                                runOnUiThread {
+                                    if (warning != null) {
+                                        statusText.text = warning
+                                        speak(warning)
+                                    } else {
+                                        val topDetections = results.take(3).joinToString(", ") {
+                                            val label = decisionEngine.getDisplayLabel(it.label)
+                                            "$label (%${(it.confidence * 100).toInt()})"
+                                        }
+                                        val distanceStr = if (currentDistanceCm > 0) "${currentDistanceCm} cm" else "Bağlı değil"
+                                        if (topDetections.isNotEmpty()) {
+                                            statusText.text = "Tespit: $topDetections | Mesafe: $distanceStr"
+                                        } else {
+                                            statusText.text = "Sistem Aktif (Tespit Yok) | Sensör: $distanceStr"
+                                        }
+                                    }
+                                }
+                            } else {
+                                runOnUiThread {
+                                    statusText.text = "Model Yüklenemedi! (yoloDetector = null)"
+                                }
+                            }
                         }
+                    } catch (e: Exception) {
+                        runOnUiThread {
+                            statusText.text = "Hata: ${e.javaClass.name}: ${e.localizedMessage}"
+                        }
+                        e.printStackTrace()
+                    } finally {
+                        imageProxy.close()
                     }
                 }
-                imageProxy.close()
-            }
 
-            cameraProvider.unbindAll()
-            cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis)
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalysis)
+            } catch (e: Exception) {
+                statusText.text = "Kamera Başlatma Hatası: ${e.localizedMessage}"
+            }
         }, ContextCompat.getMainExecutor(this))
     }
 
@@ -145,7 +194,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun speak(text: String) {
-        tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "WARN_${System.currentTimeMillis()}")
+        if (::tts.isInitialized) {
+            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "WARN_${System.currentTimeMillis()}")
+        }
     }
 
     override fun onDestroy() {
@@ -153,7 +204,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         cameraExecutor.shutdown()
         yoloDetector?.close()
         bluetoothManager.close()
-        tts.stop()
-        tts.shutdown()
+        if (::tts.isInitialized) {
+            tts.stop()
+            tts.shutdown()
+        }
     }
 }
