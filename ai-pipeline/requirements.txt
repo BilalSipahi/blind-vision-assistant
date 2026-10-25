@@ -1,0 +1,5 @@
+ultralytics>=8.3.0
+tensorflow>=2.15.0
+onnx>=1.16.0
+opencv-python>=4.10.0
+numpy>=1.26.0

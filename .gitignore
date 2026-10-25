@@ -1,0 +1,23 @@
+# Python & AI
+__pycache__/
+*.py[cod]
+*.pt
+*.onnx
+*.tflite
+venv/
+.env
+
+# PlatformIO / ESP32
+.pio/
+.vscode/
+
+# Android Studio / Gradle
+*.iml
+.gradle/
+/local.properties
+/.idea/
+.DS_Store
+/build/
+/captures/
+.externalNativeBuild/
+.cxx/
