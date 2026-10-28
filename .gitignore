@@ -4,6 +4,7 @@ __pycache__/
 *.pt
 *.onnx
 *.tflite
+!android-app/app/src/main/assets/*.tflite
 venv/
 .env
 

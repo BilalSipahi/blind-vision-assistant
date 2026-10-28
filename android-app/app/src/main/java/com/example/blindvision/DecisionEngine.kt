@@ -12,10 +12,12 @@ data class DetectionResult(
 )
 
 class DecisionEngine {
-    private val lastSpokenTimestamps = HashMap<String, Long>()
+    private val lastSpokenMap = HashMap<String, Long>()
     private val cooldownMs = 3500L
+    private var lastSpokenAnnouncement: String? = null
 
-    private val labelTranslations = mapOf(
+    // Anlamlı ve geçerli nesne isimleri sözlüğü (Bilinmeyen veya anlamsız kelimeler kesinlikle seslendirilmez)
+    private val validMeaningfulObjects = mapOf(
         "person" to "insan", "insan" to "insan",
         "car" to "araba", "araba" to "araba",
         "motorcycle" to "motosiklet", "motosiklet" to "motosiklet",
@@ -26,64 +28,97 @@ class DecisionEngine {
         "stop sign" to "dur tabelası", "dur tabelasi" to "dur tabelası",
         "bench" to "bank", "bank" to "bank",
         "chair" to "sandalye", "sandalye" to "sandalye",
-        "couch" to "koltuk", "koltuk" to "koltuk",
+        "couch" to "koltuk", "koltuk" to "koltuk", "sofa" to "koltuk",
         "dog" to "köpek", "kopek" to "köpek",
         "cat" to "kedi", "kedi" to "kedi",
         "bottle" to "şişe", "sise" to "şişe",
         "cup" to "bardak", "bardak" to "bardak",
-        "dining table" to "masa", "yemek masasi" to "masa",
-        "cell phone" to "telefon", "cep telefonu" to "telefon",
-        "laptop" to "bilgisayar", "dizustu bilgisayar" to "bilgisayar",
-        "backpack" to "sırt çantası", "sirt cantasi" to "sırt çantası",
+        "dining table" to "masa", "yemek masasi" to "masa", "masa" to "masa",
+        "cell phone" to "telefon", "cep telefonu" to "telefon", "telefon" to "telefon",
+        "laptop" to "bilgisayar", "dizustu bilgisayar" to "bilgisayar", "bilgisayar" to "bilgisayar",
+        "backpack" to "sırt çantası", "sirt cantasi" to "sırt çantası", "çanta" to "çanta",
         "suitcase" to "bavul", "bavul" to "bavul",
         "umbrella" to "şemsiye", "semsiye" to "şemsiye",
         "potted plant" to "saksı bitkisi", "saksi bitkisi" to "saksı bitkisi",
         "book" to "kitap", "kitap" to "kitap",
         "tv" to "televizyon", "televizyon" to "televizyon",
         "keyboard" to "klavye", "klavye" to "klavye",
-        "mouse" to "fare", "fare" to "fare"
+        "mouse" to "fare", "fare" to "fare",
+        "door" to "kapı", "kapi" to "kapı",
+        "clock" to "saat", "saat" to "saat",
+        "vase" to "vazo", "vazo" to "vazo",
+        "scissors" to "makas", "makas" to "makas",
+        "teddy bear" to "oyuncak ayı", "oyuncak ayi" to "oyuncak ayı"
     )
 
-    fun getDisplayLabel(rawLabel: String): String {
-        val key = rawLabel.lowercase()
-        return labelTranslations[key] ?: rawLabel
+    fun getDisplayLabel(rawLabel: String): String? {
+        val key = rawLabel.lowercase().trim()
+        return validMeaningfulObjects[key]
     }
 
-    fun calculateClockDirection(normX: Float): String {
+    fun calculateDirection(normX: Float): String {
         return when {
-            normX < 0.35f -> "Saat 10 yönünde"
-            normX > 0.65f -> "Saat 2 yönünde"
+            normX < 0.33f -> "Solunda"
+            normX > 0.66f -> "Sağında"
             else -> "Önünde"
         }
     }
 
+    /**
+     * Kadrajdaki tespitleri değerlendirir:
+     * 1. Şartlama: Yalnızca anlamlı nesne sözlüğünde olan nesneler kabul edilir.
+     * 2. En Fazla Yer Kaplayan Cisim: Kamerada bounding box alanı (boxAreaRatio) EN BÜYÜK olan tek nesne seçilir.
+     * 3. Cooldown: Aynı nesne 3.5 sn geçmeden tekrar anons edilmez.
+     */
     fun evaluateDetections(detections: List<DetectionResult>, tofDistanceCm: Int): String? {
         if (detections.isEmpty()) return null
 
-        val relevant = detections.maxByOrNull { it.confidence * it.boxAreaRatio } ?: return null
+        // 1. Şartlama: Sadece anlamlı bir Türkçe nesne adına karşılık gelen nesneleri al
+        val validDetections = detections.mapNotNull { detection ->
+            val turkishLabel = getDisplayLabel(detection.label)
+            if (turkishLabel != null) {
+                Pair(detection, turkishLabel)
+            } else {
+                null
+            }
+        }
 
-        val direction = calculateClockDirection(relevant.normalizedCenterX)
+        // Anlamlı bir kelime/nesne yoksa KESİNLİKLE SESLENDİRME YAPMA
+        if (validDetections.isEmpty()) return null
 
-        // Merkezdeki cisim icin ToF sensorunu kullan, kenardaki cisim icin bounding-box tahmini yap
-        val estimatedCm = if (relevant.normalizedCenterX in 0.35f..0.65f && tofDistanceCm in 10..350) {
+        // 2. Kamerada EN FAZLA YER KAPLAYAN (boxAreaRatio en büyük olan) cismi seç
+        val (largestObject, displayLabel) = validDetections.maxByOrNull { it.first.boxAreaRatio } ?: return null
+
+        val now = SystemClock.elapsedRealtime()
+
+        // 3. Cooldown Kontrolü (3.5 saniye)
+        val lastSpokenTime = lastSpokenMap[displayLabel] ?: 0L
+        if (now - lastSpokenTime < cooldownMs) {
+            return null
+        }
+
+        val direction = calculateDirection(largestObject.normalizedCenterX)
+
+        val estimatedCm = if (largestObject.normalizedCenterX in 0.33f..0.66f && tofDistanceCm in 10..350) {
             tofDistanceCm
         } else {
-            estimateDistanceFromBox(relevant.boxAreaRatio)
+            estimateDistanceFromBox(largestObject.boxAreaRatio)
         }
 
         if (estimatedCm > 300 || estimatedCm <= 0) return null
 
-        val displayLabel = getDisplayLabel(relevant.label)
-
-        val now = SystemClock.elapsedRealtime()
-        val key = "${displayLabel}_$direction"
-        val lastTime = lastSpokenTimestamps[key] ?: 0L
-
-        if (now - lastTime < cooldownMs) return null
-
-        lastSpokenTimestamps[key] = now
         val meters = estimatedCm / 100.0f
-        return String.format(Locale.getDefault(), "%s, %.1f metrede %s", direction, meters, displayLabel)
+        val announcement = String.format(Locale.getDefault(), "%s, %.1f metrede %s", direction, meters, displayLabel)
+
+        // Gereksiz tekrarları önleme
+        if (announcement == lastSpokenAnnouncement && (now - lastSpokenTime < cooldownMs * 2)) {
+            return null
+        }
+
+        lastSpokenMap[displayLabel] = now
+        lastSpokenAnnouncement = announcement
+
+        return announcement
     }
 
     private fun estimateDistanceFromBox(areaRatio: Float): Int {

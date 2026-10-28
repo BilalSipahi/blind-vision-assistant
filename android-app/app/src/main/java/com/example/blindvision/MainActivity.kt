@@ -8,8 +8,10 @@ import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
 import android.widget.TextView
+import androidx.annotation.OptIn
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.ExperimentalGetImage
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
@@ -21,6 +23,12 @@ import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.Executors
 
+enum class AppMode(val title: String, val spokenAnnouncement: String) {
+    OBJECT_DETECTION("Nesne Tespiti Modu", "Nesne tespiti modu devrede."),
+    TEXT_READING("Metin Okuma Modu", "Metin okuma modu devrede."),
+    CURRENCY_RECOGNITION("Para Tanıma Modu", "Para tanıma modu devrede.")
+}
+
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     private lateinit var previewView: PreviewView
@@ -28,12 +36,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private lateinit var tts: TextToSpeech
     private lateinit var decisionEngine: DecisionEngine
     private lateinit var bluetoothManager: BluetoothManager
+    private lateinit var textReader: TextReader
+    private lateinit var currencyRecognizer: CurrencyRecognizer
     private var yoloDetector: YoloDetector? = null
+
+    private var currentMode = AppMode.OBJECT_DETECTION
 
     @Volatile private var currentDistanceCm: Int = -1
     private val cameraExecutor = Executors.newSingleThreadExecutor()
     private var lastInferenceTime = 0L
-    private val inferenceIntervalMs = 100L // Saniyede 10 FPS siniri (Isinmayi onler)
+    private val inferenceIntervalMs = 100L // Saniyede 10 FPS siniri
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,8 +72,27 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         root.addView(statusText)
         setContentView(root)
 
+        // Görme engelliler için EKRANA DOKUNMA İLE MOD DEĞİŞTİRME
+        root.setOnClickListener {
+            switchMode()
+        }
+
         decisionEngine = DecisionEngine()
         tts = TextToSpeech(this, this)
+
+        textReader = TextReader { recognizedText ->
+            runOnUiThread {
+                statusText.text = "Okunan Metin: $recognizedText"
+                speak(recognizedText)
+            }
+        }
+
+        currencyRecognizer = CurrencyRecognizer(this) { currencyText ->
+            runOnUiThread {
+                statusText.text = "Algılanan Para: $currencyText"
+                speak(currencyText)
+            }
+        }
 
         try {
             yoloDetector = YoloDetector(this)
@@ -74,6 +105,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
 
         checkAndRequestPermissions()
+    }
+
+    private fun switchMode() {
+        currentMode = when (currentMode) {
+            AppMode.OBJECT_DETECTION -> AppMode.TEXT_READING
+            AppMode.TEXT_READING -> AppMode.CURRENCY_RECOGNITION
+            AppMode.CURRENCY_RECOGNITION -> AppMode.OBJECT_DETECTION
+        }
+
+        statusText.text = currentMode.title
+        speak(currentMode.spokenAnnouncement, force = true)
     }
 
     private fun checkAndRequestPermissions() {
@@ -111,6 +153,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    @OptIn(ExperimentalGetImage::class)
     private fun startCamera() {
         statusText.text = "Kamera Başlatılıyor..."
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
@@ -121,7 +164,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     it.setSurfaceProvider(previewView.surfaceProvider)
                 }
 
-                statusText.text = "Kamera Aktif - Nesne Tespiti Başlatılıyor..."
+                statusText.text = "${currentMode.title} Aktif"
 
                 val imageAnalysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -132,48 +175,60 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         val now = System.currentTimeMillis()
                         if (now - lastInferenceTime >= inferenceIntervalMs) {
                             lastInferenceTime = now
-                            if (yoloDetector != null) {
-                                val rawBitmap = imageProxy.toBitmap()
-                                val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                                val bitmap = if (rotationDegrees != 0) {
-                                    val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
-                                    Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
-                                } else {
-                                    rawBitmap
-                                }
 
-                                val results = yoloDetector!!.detect(bitmap)
-                                val warning = decisionEngine.evaluateDetections(results, currentDistanceCm)
-
-                                runOnUiThread {
-                                    if (warning != null) {
-                                        statusText.text = warning
-                                        speak(warning)
-                                    } else {
-                                        val topDetections = results.take(3).joinToString(", ") {
-                                            val label = decisionEngine.getDisplayLabel(it.label)
-                                            "$label (%${(it.confidence * 100).toInt()})"
-                                        }
-                                        val distanceStr = if (currentDistanceCm > 0) "${currentDistanceCm} cm" else "Bağlı değil"
-                                        if (topDetections.isNotEmpty()) {
-                                            statusText.text = "Tespit: $topDetections | Mesafe: $distanceStr"
+                            when (currentMode) {
+                                AppMode.OBJECT_DETECTION -> {
+                                    if (yoloDetector != null) {
+                                        val rawBitmap = imageProxy.toBitmap()
+                                        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                                        val bitmap = if (rotationDegrees != 0) {
+                                            val matrix = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
+                                            Bitmap.createBitmap(rawBitmap, 0, 0, rawBitmap.width, rawBitmap.height, matrix, true)
                                         } else {
-                                            statusText.text = "Sistem Aktif (Tespit Yok) | Sensör: $distanceStr"
+                                            rawBitmap
+                                        }
+
+                                        val results = yoloDetector!!.detect(bitmap)
+                                        val warning = decisionEngine.evaluateDetections(results, currentDistanceCm)
+
+                                        runOnUiThread {
+                                            if (warning != null) {
+                                                statusText.text = warning
+                                                speak(warning)
+                                            } else {
+                                                val topDetections = results.mapNotNull {
+                                                    val label = decisionEngine.getDisplayLabel(it.label)
+                                                    if (label != null) "$label (%${(it.confidence * 100).toInt()})" else null
+                                                }.take(3).joinToString(", ")
+
+                                                val distanceStr = if (currentDistanceCm > 0) "${currentDistanceCm} cm" else "Bağlı değil"
+                                                if (topDetections.isNotEmpty()) {
+                                                    statusText.text = "Tespit: $topDetections | Mesafe: $distanceStr"
+                                                } else {
+                                                    statusText.text = "Sistem Aktif (Tespit Yok) | Sensör: $distanceStr"
+                                                }
+                                            }
                                         }
                                     }
+                                    imageProxy.close()
                                 }
-                            } else {
-                                runOnUiThread {
-                                    statusText.text = "Model Yüklenemedi! (yoloDetector = null)"
+                                AppMode.TEXT_READING -> {
+                                    // ML Kit Metin Okuma
+                                    textReader.processImage(imageProxy)
+                                }
+                                AppMode.CURRENCY_RECOGNITION -> {
+                                    // TL Para Tanıma Modu
+                                    currencyRecognizer.processImage(imageProxy)
                                 }
                             }
+                        } else {
+                            imageProxy.close()
                         }
                     } catch (e: Exception) {
                         runOnUiThread {
                             statusText.text = "Hata: ${e.javaClass.name}: ${e.localizedMessage}"
                         }
                         e.printStackTrace()
-                    } finally {
                         imageProxy.close()
                     }
                 }
@@ -189,13 +244,17 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             tts.setLanguage(Locale("tr", "TR"))
-            speak("Görme engelli asistanı aktif.")
+            speak("Görme engelli asistanı aktif. Mod değiştirmek için ekrana dokunun.", force = true)
         }
     }
 
-    private fun speak(text: String) {
+    private fun speak(text: String, force: Boolean = false) {
         if (::tts.isInitialized) {
-            tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "WARN_${System.currentTimeMillis()}")
+            if (force) {
+                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "FORCE_${System.currentTimeMillis()}")
+            } else if (!tts.isSpeaking) {
+                tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "ANNOUNCE_${System.currentTimeMillis()}")
+            }
         }
     }
 
@@ -203,6 +262,8 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         super.onDestroy()
         cameraExecutor.shutdown()
         yoloDetector?.close()
+        textReader.close()
+        currencyRecognizer.close()
         bluetoothManager.close()
         if (::tts.isInitialized) {
             tts.stop()
